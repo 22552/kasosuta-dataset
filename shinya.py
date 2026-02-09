@@ -50,4 +50,4 @@ st.write(f"検索結果: {len(results)} 件")
 
 for c in results:
     prefix = "↳ " if c["is_reply"] else ""
-    st.write(f"{prefix}[{c['datetime']}] {c['user']}: {c['content']}")
+    st.write(f"{prefix}ID:{c['id']} [{c['datetime']}] {c['user']}: {c['content']}")
