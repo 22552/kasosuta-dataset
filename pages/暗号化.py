@@ -6,30 +6,34 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import os
 import base64
 
-st.title("楕円曲線暗号 ECDH + AES 完全版")
+st.title("ECC 暗号フル版（圧縮公開鍵対応）")
 
 # -------------------------
 # 🔑 鍵生成
 # -------------------------
 if st.button("新しい鍵ペア生成"):
     private_key = ec.generate_private_key(ec.SECP256R1())
-    public_key = private_key.public_key()
-
     st.session_state.private_key = private_key
 
-    priv_bytes = private_key.private_bytes(
+    public_key = private_key.public_key()
+
+    # 秘密鍵PEM
+    priv_pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption()
     )
 
-    pub_bytes = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    # 圧縮公開鍵
+    compressed_pub = public_key.public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.CompressedPoint
     )
 
-    st.text_area("秘密鍵（保存しろ）", priv_bytes.decode(), height=200)
-    st.text_area("公開鍵（相手に渡せ）", pub_bytes.decode(), height=200)
+    short_pub = base64.b64encode(compressed_pub).decode()
+
+    st.text_area("秘密鍵（保存しろ）", priv_pem.decode(), height=200)
+    st.text_input("短い公開鍵（これ渡せ）", short_pub)
 
 # -------------------------
 # 🔐 秘密鍵読み込み
@@ -38,48 +42,66 @@ st.subheader("既存の秘密鍵を読み込む")
 
 priv_input = st.text_area("秘密鍵PEMを貼る")
 
-if st.button("秘密鍵をセット"):
+if st.button("秘密鍵セット"):
     try:
         private_key = serialization.load_pem_private_key(
             priv_input.encode(),
             password=None,
         )
         st.session_state.private_key = private_key
-        st.success("秘密鍵読み込み成功")
-    except Exception as e:
+
+        # 公開鍵復元
+        public_key = private_key.public_key()
+
+        compressed_pub = public_key.public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.CompressedPoint
+        )
+
+        short_pub = base64.b64encode(compressed_pub).decode()
+
+        st.success("読み込み成功")
+        st.text_input("復元された短い公開鍵", short_pub)
+
+    except Exception:
         st.error("読み込み失敗")
 
 # -------------------------
-# 🔓 暗号・復号エリア
+# 🔓 暗号 / 復号
 # -------------------------
 st.subheader("暗号 / 復号")
 
-peer_pub_input = st.text_area("相手の公開鍵PEM")
+peer_short_pub = st.text_input("相手の短い公開鍵")
 
 plaintext = st.text_input("暗号化するテキスト")
 
+def derive_shared_key(private_key, peer_compressed_b64):
+    peer_bytes = base64.b64decode(peer_compressed_b64)
+    peer_public_key = ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP256R1(),
+        peer_bytes
+    )
+
+    shared_key = private_key.exchange(ec.ECDH(), peer_public_key)
+
+    derived_key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"handshake data",
+    ).derive(shared_key)
+
+    return derived_key
+
 if st.button("暗号化"):
     if "private_key" not in st.session_state:
-        st.error("秘密鍵がセットされてない")
+        st.error("秘密鍵セットして")
     else:
         try:
-            peer_public_key = serialization.load_pem_public_key(
-                peer_pub_input.encode()
-            )
-
-            shared_key = st.session_state.private_key.exchange(
-                ec.ECDH(), peer_public_key
-            )
-
-            derived_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"handshake data",
-            ).derive(shared_key)
+            key = derive_shared_key(st.session_state.private_key, peer_short_pub)
 
             iv = os.urandom(16)
-            cipher = Cipher(algorithms.AES(derived_key), modes.CFB(iv))
+            cipher = Cipher(algorithms.AES(key), modes.CFB(iv))
             encryptor = cipher.encryptor()
             ciphertext = encryptor.update(plaintext.encode()) + encryptor.finalize()
 
@@ -93,29 +115,16 @@ cipher_input = st.text_area("復号する暗号文")
 
 if st.button("復号"):
     if "private_key" not in st.session_state:
-        st.error("秘密鍵がセットされてない")
+        st.error("秘密鍵セットして")
     else:
         try:
-            peer_public_key = serialization.load_pem_public_key(
-                peer_pub_input.encode()
-            )
-
-            shared_key = st.session_state.private_key.exchange(
-                ec.ECDH(), peer_public_key
-            )
-
-            derived_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"handshake data",
-            ).derive(shared_key)
+            key = derive_shared_key(st.session_state.private_key, peer_short_pub)
 
             raw = base64.b64decode(cipher_input)
             iv = raw[:16]
             ciphertext = raw[16:]
 
-            cipher = Cipher(algorithms.AES(derived_key), modes.CFB(iv))
+            cipher = Cipher(algorithms.AES(key), modes.CFB(iv))
             decryptor = cipher.decryptor()
             decrypted = decryptor.update(ciphertext) + decryptor.finalize()
 
