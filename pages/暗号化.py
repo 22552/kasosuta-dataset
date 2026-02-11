@@ -44,15 +44,19 @@ priv_input = st.text_area("秘密鍵PEMを貼る")
 
 if st.button("秘密鍵セット"):
     try:
+        clean_key = priv_input.strip().encode()
+
         private_key = serialization.load_pem_private_key(
-            priv_input.encode(),
+            clean_key,
             password=None,
         )
+
         st.session_state.private_key = private_key
 
         # 公開鍵復元
         public_key = private_key.public_key()
 
+        # 圧縮公開鍵
         compressed_pub = public_key.public_bytes(
             encoding=serialization.Encoding.X962,
             format=serialization.PublicFormat.CompressedPoint
@@ -63,8 +67,8 @@ if st.button("秘密鍵セット"):
         st.success("読み込み成功")
         st.text_input("復元された短い公開鍵", short_pub)
 
-    except Exception:
-        st.error("読み込み失敗")
+    except Exception as e:
+        st.error(f"読み込み失敗: {e}")
 
 # -------------------------
 # 🔓 暗号 / 復号
