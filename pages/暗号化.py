@@ -31,7 +31,7 @@ if st.button("新しい鍵ペア生成"):
     )
 
     short_pub = base64.b64encode(compressed_pub).decode()
-
+    st.info("注意！秘密鍵は-----BEGIN PRIVATE KEY-----などの囲みも含みます。")
     st.text_area("秘密鍵（保存しろ）", priv_pem.decode(), height=200)
     st.text_input("短い公開鍵（これ渡せ）", short_pub)
 
