@@ -66,9 +66,9 @@ if st.button("検索"):
 
     # 🔥 親 → 返信 の順になる並び
     query += """
-    ORDER BY
-        COALESCE(parent_id, id),
-        datetime DESC
+ORDER BY
+    COALESCE(parent_id, id) DESC,
+    datetime ASC
     """
 
     rows = cur.execute(query, params).fetchall()
