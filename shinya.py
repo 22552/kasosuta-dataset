@@ -84,4 +84,4 @@ if st.button("検索"):
 
         for c in results[start:end]:
             prefix = "↳ " if c["is_reply"] else ""
-            st.write(f"{prefix}ID:{c['id']} [{c['datetime']}] {c['user']}: {c['content']}")ime']}] {c['user']}: {c['content']}")
+            st.write(f"{prefix}ID:{c['id']} [{c['datetime']}] {c['user']}: {c['content']}")
