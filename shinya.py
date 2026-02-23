@@ -92,4 +92,4 @@ if "rows" in st.session_state:
     for r in rows[start:end]:
         prefix = "↳ " if r[4] == 1 else ""
         parent = f"(返信先: {r[5]})" if r[4] == 1 else ""
-        st.write(f"{prefix}{r[2]} {r[1]}: {r[3]} {parent}")
+        st.write(f"{prefix}{r[0]}{r[2]} {r[1]}: {r[3]} {parent}")
