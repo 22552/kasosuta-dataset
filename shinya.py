@@ -48,7 +48,12 @@ text_q = st.text_input("内容")
 
 if st.button("検索"):
 
-    query = "SELECT id,user,datetime,content,is_reply,parent_id FROM comments WHERE 1=1"
+    query = """
+    SELECT id,user,datetime,content,is_reply,parent_id
+    FROM comments
+    WHERE 1=1
+    """
+
     params = []
 
     if user_q:
@@ -59,7 +64,12 @@ if st.button("検索"):
         query += " AND content LIKE ?"
         params.append(f"%{text_q}%")
 
-    query += " ORDER BY datetime DESC"
+    # 🔥 親 → 返信 の順になる並び
+    query += """
+    ORDER BY
+        COALESCE(parent_id, id),
+        datetime ASC
+    """
 
     rows = cur.execute(query, params).fetchall()
 
@@ -92,4 +102,4 @@ if "rows" in st.session_state:
     for r in rows[start:end]:
         prefix = "↳ " if r[4] == 1 else ""
         parent = f"(返信先: {r[5]})" if r[4] == 1 else ""
-        st.write(f"{prefix}{r[0]}{r[2]} {r[1]}: {r[3]} {parent}")
+        st.write(f"{prefix}ID:{r[0]} [{r[2]}] {r[1]}: {r[3]} {parent}")
