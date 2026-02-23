@@ -1,14 +1,19 @@
 import streamlit as st
 import requests
 import json
+import gzip
+import io
 
 # JSON取得（キャッシュ）
 @st.cache_data
 def load_data():
-    url = "https://raw.githubusercontent.com/hd3a/kasosuta-dataset/refs/heads/main/scratch_shinya_all.json"
+    url = "https://github.com/22552/kasotest/raw/refs/heads/main/%E7%AC%AC%E4%BA%8C%E3%83%97%E3%83%AD%E3%82%B8%E3%82%A7%E3%82%AF%E3%83%88.json.gz"
+    
     r = requests.get(url)
     r.raise_for_status()
-    return r.json()
+
+    with gzip.GzipFile(fileobj=io.BytesIO(r.content)) as f:
+        return json.load(io.TextIOWrapper(f, encoding="utf-8"))
 
 data = load_data()
 
