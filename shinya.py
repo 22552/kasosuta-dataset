@@ -68,7 +68,7 @@ if st.button("検索"):
     query += """
     ORDER BY
         COALESCE(parent_id, id),
-        datetime ASC
+        datetime DESC
     """
 
     rows = cur.execute(query, params).fetchall()
