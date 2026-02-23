@@ -1,79 +1,95 @@
 import streamlit as st
 import requests
+import sqlite3
 import gzip
-import io
-import json
+import shutil
+import os
 
-URL = "https://github.com/22552/kasotest/raw/refs/heads/main/%E7%AC%AC%E4%BA%8C%E3%83%97%E3%83%AD%E3%82%B8%E3%82%A7%E3%82%AF%E3%83%88.json.gz"
+DB_GZ_URL = "https://github.com/22552/kasosuta-dataset/releases/download/dai2v1/cmt.db.gz"
+DB_FILE = "comments.db"
+GZ_FILE = "cmt.db.gz"
 
-@st.cache_data
-def load_data():
-    with requests.get(URL, stream=True, timeout=60) as r:
+# =========================
+# DB準備
+# =========================
+def ensure_db():
+    if os.path.exists(DB_FILE):
+        return
+
+    # ダウンロード
+    if not os.path.exists(GZ_FILE):
+        r = requests.get(DB_GZ_URL, stream=True, timeout=120)
         r.raise_for_status()
-        with gzip.GzipFile(fileobj=r.raw) as f:
-            return json.load(io.TextIOWrapper(f, encoding="utf-8"))
+        with open(GZ_FILE, "wb") as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
 
-def iter_comments(data):
-    for c in data.get("comments", []):
-        yield {
-            "id": c["id"],
-            "user": c["user"],
-            "datetime": c["datetime"],
-            "content": c["content"],
-            "is_reply": False,
-        }
+    # 展開
+    with gzip.open(GZ_FILE, "rb") as f_in:
+        with open(DB_FILE, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
 
-        for r in c.get("replies", []):
-            yield {
-                "id": r["id"],
-                "user": r["user"],
-                "datetime": r["datetime"],
-                "content": r["content"],
-                "is_reply": True,
-            }
+ensure_db()
 
+# =========================
+# SQLite接続
+# =========================
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+cur = conn.cursor()
+
+# =========================
+# UI
+# =========================
 st.title("Scratch コメント検索アプリ")
-st.write("八戸市にいこう")
+st.write("八戸市にいこう!")
 
-user_q = st.text_input("ユーザー名で検索")
-text_q = st.text_input("内容で検索")
+user_q = st.text_input("ユーザー名")
+text_q = st.text_input("内容")
 
-# 検索ボタン
 if st.button("検索"):
-    data = load_data()
 
-    results = [
-        c for c in iter_comments(data)
-        if (not user_q or user_q.lower() in c["user"].lower())
-        and (not text_q or text_q.lower() in c["content"].lower())
-    ]
+    query = "SELECT id,user,datetime,content,is_reply,parent_id FROM comments WHERE 1=1"
+    params = []
 
-    st.session_state["results"] = results
+    if user_q:
+        query += " AND user LIKE ?"
+        params.append(f"%{user_q}%")
+
+    if text_q:
+        query += " AND content LIKE ?"
+        params.append(f"%{text_q}%")
+
+    query += " ORDER BY datetime DESC"
+
+    rows = cur.execute(query, params).fetchall()
+
+    st.session_state["rows"] = rows
     st.session_state["page"] = 1
 
-# 結果がある場合のみ表示
-if "results" in st.session_state:
+# =========================
+# ページ表示
+# =========================
+if "rows" in st.session_state:
 
-    results = st.session_state["results"]
+    rows = st.session_state["rows"]
 
     page_size = 200
-    total_pages = (len(results) + page_size - 1) // page_size
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
 
-    if total_pages > 0:
+    page = st.number_input(
+        "ページ",
+        min_value=1,
+        max_value=total_pages,
+        value=st.session_state.get("page", 1),
+        key="page_input"
+    )
 
-        page = st.number_input(
-            "ページ番号",
-            min_value=1,
-            max_value=total_pages,
-            value=st.session_state.get("page", 1),
-            key="page_input"
-        )
+    start = (page - 1) * page_size
+    end = start + page_size
 
-        start = (page - 1) * page_size
-        end = start + page_size
+    st.write(f"表示中: {start+1} - {min(end, len(rows))} / {len(rows)}")
 
-        st.write(f"表示中: {start+1} - {min(end, len(results))} / {len(results)}")
-
-        for c in results[start:end]:
-            prefix = "↳ " if c["is_reply"] else ""
-            st.write(f"{prefix}ID:{c['id']} [{c['datetime']}] {c['user']}: {c['content']}")
+    for r in rows[start:end]:
+        prefix = "↳ " if r[4] == 1 else ""
+        parent = f"(返信先: {r[5]})" if r[4] == 1 else ""
+        st.write(f"{prefix}{r[2]} {r[1]}: {r[3]} {parent}")
