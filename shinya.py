@@ -6,19 +6,13 @@ import json
 
 URL = "https://github.com/22552/kasotest/raw/refs/heads/main/%E7%AC%AC%E4%BA%8C%E3%83%97%E3%83%AD%E3%82%B8%E3%82%A7%E3%82%AF%E3%83%88.json.gz"
 
-# =========================
-# データ読み込み（キャッシュ）
-# =========================
 @st.cache_data
 def load_data():
-    with requests.get(URL, stream=True) as r:
+    with requests.get(URL, stream=True, timeout=60) as r:
         r.raise_for_status()
         with gzip.GzipFile(fileobj=r.raw) as f:
             return json.load(io.TextIOWrapper(f, encoding="utf-8"))
 
-# =========================
-# コメントを1件ずつ生成
-# =========================
 def iter_comments(data):
     for c in data.get("comments", []):
         yield {
@@ -38,43 +32,41 @@ def iter_comments(data):
                 "is_reply": True,
             }
 
-# =========================
-# UI
-# =========================
 st.title("Scratch コメント検索アプリ")
-st.write("Created by ncyo")
+st.write("八戸市にいこう")
 
 user_q = st.text_input("ユーザー名で検索")
 text_q = st.text_input("内容で検索")
 
+# 検索ボタン
 if st.button("検索"):
-
     data = load_data()
 
-    # 🔥 ここで一気にリスト化しない
-    results = []
+    results = [
+        c for c in iter_comments(data)
+        if (not user_q or user_q.lower() in c["user"].lower())
+        and (not text_q or text_q.lower() in c["content"].lower())
+    ]
 
-    for c in iter_comments(data):
-        if user_q and user_q.lower() not in c["user"].lower():
-            continue
-        if text_q and text_q.lower() not in c["content"].lower():
-            continue
-        results.append(c)
+    st.session_state["results"] = results
+    st.session_state["page"] = 1
 
-    st.write(f"検索結果: {len(results)} 件")
+# 結果がある場合のみ表示
+if "results" in st.session_state:
 
-    # ページネーション
+    results = st.session_state["results"]
+
     page_size = 200
     total_pages = (len(results) + page_size - 1) // page_size
 
-    if total_pages == 0:
-        st.write("結果なし")
-    else:
+    if total_pages > 0:
+
         page = st.number_input(
             "ページ番号",
             min_value=1,
             max_value=total_pages,
-            value=1
+            value=st.session_state.get("page", 1),
+            key="page_input"
         )
 
         start = (page - 1) * page_size
