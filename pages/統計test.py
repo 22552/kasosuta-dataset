@@ -2,21 +2,29 @@ import streamlit as st
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
-from datetime import datetime
+import gzip
+import io
 
 st.title("統計")
 
+# ------------------------
+# データ取得（キャッシュ）
+# ------------------------
 @st.cache_data
 def load_data():
     url = "https://raw.githubusercontent.com/hd3a/kasosuta-dataset/refs/heads/main/scratch_shinya_all.json"
-    r = requests.get(url)
-    r.raise_for_status()
-    return r.json()
+
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        return r.json()
 
 data = load_data()
 
+# ------------------------
 # 平坦化
+# ------------------------
 comments_list = []
+
 for c in data.get("comments", []):
     comments_list.append({
         "id": c["id"],
@@ -26,6 +34,7 @@ for c in data.get("comments", []):
         "is_reply": False,
         "parent_id": None
     })
+
     for r in c.get("replies", []):
         comments_list.append({
             "id": r["id"],
@@ -43,10 +52,11 @@ df["datetime"] = pd.to_datetime(df["datetime"])
 # 期間指定
 # ------------------------
 st.subheader("期間指定")
+
 start_date = st.date_input("開始日")
 end_date = st.date_input("終了日")
 
-filtered = df.copy()
+filtered = df
 
 if start_date and end_date:
     filtered = filtered[
@@ -71,14 +81,15 @@ st.subheader("日別コメント数")
 
 daily = filtered.groupby(filtered["datetime"].dt.date).size()
 
-plt.figure()
-daily.plot()
-plt.xlabel("Date")
-plt.ylabel("Comments")
-st.pyplot(plt)
+fig, ax = plt.subplots()
+daily.plot(ax=ax)
+ax.set_xlabel("Date")
+ax.set_ylabel("Comments")
+
+st.pyplot(fig)
 
 # ------------------------
-# 返信率
+# 返信統計
 # ------------------------
 st.subheader("返信統計")
 
@@ -88,4 +99,8 @@ originals = total - replies
 
 st.write(f"元コメント: {originals}")
 st.write(f"返信: {replies}")
-st.write(f"返信率: {round(replies/total*100,2) if total else 0}%")
+
+if total > 0:
+    st.write(f"返信率: {round(replies / total * 100, 2)}%")
+else:
+    st.write("返信率: 0%")
