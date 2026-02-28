@@ -4,6 +4,8 @@ import sqlite3
 import gzip
 import shutil
 import os
+import html
+import urllib.parse  # 追加：URLエンコード対策
 
 DB_GZ_URL = "https://github.com/22552/kasosuta-dataset/releases/download/dai2v1/cmt.db.gz"
 DB_FILE = "comments.db"
@@ -44,7 +46,7 @@ st.title("Scratch コメント検索アプリ")
 st.write("八戸市にいこう!")
 
 user_q = st.text_input("ユーザー名")
-text_q = st.text_input("内容")
+text_q = st.text_input("内容 (>> や 絵文字もOK)")
 
 if st.button("検索"):
 
@@ -61,8 +63,20 @@ if st.button("検索"):
         params.append(f"%{user_q}%")
 
     if text_q:
-        query += " AND content LIKE ?"
-        params.append(f"%{text_q}%")
+        # --- 検索強化ロジック ---
+        # 1. 通常の入力
+        # 2. HTMLエスケープ ( > -> &gt; など)
+        # 3. URLエンコード (絵文字や特殊記号対策)
+        
+        escaped_q = html.escape(text_q)
+        url_encoded_q = urllib.parse.quote(text_q)
+        
+        # OR条件で、いずれかの形式で保存されていればヒットするようにする
+        query += " AND (content LIKE ? OR content LIKE ? OR content LIKE ?)"
+        params.append(f"%{text_q}%")      # そのまま
+        params.append(f"%{escaped_q}%")  # &gt; など
+        params.append(f"%{url_encoded_q}%") # %F0%9F... など
+        # -----------------------
 
     # 🔥 親 → 返信 の順になる並び
     query += """
@@ -102,4 +116,13 @@ if "rows" in st.session_state:
     for r in rows[start:end]:
         prefix = "↳ " if r[4] == 1 else ""
         parent = f"(返信先: {r[5]})" if r[4] == 1 else ""
-        st.write(f"{prefix}ID:{r[0]} [{r[2]}] {r[1]}: {r[3]} {parent}")
+        
+        # 表示時は人間が読みやすいようにデコード（戻す）して表示
+        # ※HTMLエンティティとURLエンコードの両方を解除
+        display_content = html.unescape(r[3])
+        try:
+            display_content = urllib.parse.unquote(display_content)
+        except:
+            pass
+            
+        st.write(f"{prefix}ID:{r[0]} [{r[2]}] {r[1]}: {display_content} {parent}")
