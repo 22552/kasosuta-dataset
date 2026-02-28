@@ -46,7 +46,7 @@ st.title("Scratch コメント検索アプリ")
 st.write("八戸市にいこう!")
 
 user_q = st.text_input("ユーザー名")
-text_q = st.text_input("内容 (>> や 絵文字もOK)")
+text_q = st.text_input("内容")
 
 if st.button("検索"):
 
