@@ -1,17 +1,16 @@
-import gzip
 import html
 import os
 import re
-import shutil
 import sqlite3
+import subprocess
 import urllib.parse
 
 import requests
 import streamlit as st
 
-DB_GZ_URL = "https://github.com/22552/kasosuta-dataset/releases/download/dai2v1/cmt.db.gz"
+DB_ZST_URL = "https://raw.githubusercontent.com/22552/kasotest/main/%E7%AC%AC%E4%BA%8C%E3%83%97%E3%83%AD%E3%82%B8%E3%82%A7%E3%82%AF%E3%83%88.sqlite.zst"
 DB_FILE = "comments.db"
-GZ_FILE = "cmt.db.gz"
+ZST_FILE = "comments.sqlite.zst"
 PAGE_SIZE = 200
 
 
@@ -33,32 +32,37 @@ def _valid_sqlite(path: str) -> bool:
             con.close()
 
 
-@st.cache_resource(show_spinner="コメントDBを準備しています…")
+@st.cache_resource(show_spinner="最新コメントDBを準備しています…")
 def ensure_db() -> str:
     if not _valid_sqlite(DB_FILE):
         if os.path.exists(DB_FILE):
             os.remove(DB_FILE)
 
-        if not os.path.exists(GZ_FILE) or os.path.getsize(GZ_FILE) == 0:
-            gz_tmp = GZ_FILE + ".tmp"
-            if os.path.exists(gz_tmp):
-                os.remove(gz_tmp)
+        # 最新の maximally-compressed SQLite を取得
+        if not os.path.exists(ZST_FILE) or os.path.getsize(ZST_FILE) < 90 * 1024 * 1024:
+            zst_tmp = ZST_FILE + ".tmp"
+            if os.path.exists(zst_tmp):
+                os.remove(zst_tmp)
 
-            with requests.get(DB_GZ_URL, stream=True, timeout=(15, 180)) as r:
+            with requests.get(DB_ZST_URL, stream=True, timeout=(15, 300)) as r:
                 r.raise_for_status()
-                with open(gz_tmp, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                with open(zst_tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
                         if chunk:
                             f.write(chunk)
-            os.replace(gz_tmp, GZ_FILE)
+            os.replace(zst_tmp, ZST_FILE)
 
         db_tmp = DB_FILE + ".tmp"
         if os.path.exists(db_tmp):
             os.remove(db_tmp)
 
         try:
-            with gzip.open(GZ_FILE, "rb") as f_in, open(db_tmp, "wb") as f_out:
-                shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
+            # DBは zstd --ultra -22 --long=31 で圧縮されているため、
+            # 展開側でも --long=31 を明示する。
+            subprocess.run(
+                ["zstd", "-d", "--long=31", "-f", ZST_FILE, "-o", db_tmp],
+                check=True,
+            )
             if not _valid_sqlite(db_tmp):
                 raise RuntimeError("展開したSQLite DBが壊れています")
             os.replace(db_tmp, DB_FILE)
@@ -68,7 +72,7 @@ def ensure_db() -> str:
             raise
 
     # 親コメント→返信の並び替えを高速化。
-    # 静的DBなので一度作れば以後のページ取得で使い回せる。
+    # 最新DBには検索用index/FTS5が既に入っているので、追加は表示順用だけ。
     con = None
     try:
         con = sqlite3.connect(DB_FILE)
@@ -81,7 +85,6 @@ def ensure_db() -> str:
         con.execute("PRAGMA optimize")
         con.commit()
     except sqlite3.Error:
-        # インデックス作成に失敗しても検索自体は可能
         pass
     finally:
         if con is not None:
@@ -97,7 +100,6 @@ DB_PATH = ensure_db()
 # SQLite接続
 # =========================
 def open_db() -> sqlite3.Connection:
-    # datasetは更新されないので immutable=1 でロック処理を省く
     uri = f"file:{DB_PATH}?mode=ro&immutable=1"
     con = sqlite3.connect(uri, uri=True, timeout=10)
     con.execute("PRAGMA query_only=ON")
@@ -138,7 +140,6 @@ def build_where(user_q: str, text_q: str) -> tuple[str, list[str]]:
             is_exclude = word.startswith("-") and len(word) > 1
             search_word = word[1:] if is_exclude else word
 
-            # OR: foo|bar
             if "|" in search_word and not is_exclude:
                 groups = []
                 for part in (p for p in search_word.split("|") if p):
@@ -200,7 +201,7 @@ def set_result_page(page: int) -> None:
 # =========================
 st.title("Scratch コメント高度検索")
 st.write("八戸市にいこう!")
-st.caption("検索対象はDB全体。表示だけ1ページ200件です。")
+st.caption("最新版データセットをDB全体から検索。表示だけ1ページ200件です。")
 
 with st.expander("🔍 検索の使いかた", expanded=False):
     st.markdown(
