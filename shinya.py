@@ -5,7 +5,6 @@ import re
 import shutil
 import sqlite3
 import urllib.parse
-from pathlib import Path
 
 import requests
 import streamlit as st
@@ -22,19 +21,21 @@ PAGE_SIZE = 200
 def _valid_sqlite(path: str) -> bool:
     if not os.path.exists(path) or os.path.getsize(path) < 4096:
         return False
+    con = None
     try:
         con = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
         con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
-        con.close()
         return True
     except sqlite3.Error:
         return False
+    finally:
+        if con is not None:
+            con.close()
 
 
 @st.cache_resource(show_spinner="コメントDBを準備しています…")
 def ensure_db() -> str:
     if not _valid_sqlite(DB_FILE):
-        # 壊れた/途中のDBは再利用しない
         if os.path.exists(DB_FILE):
             os.remove(DB_FILE)
 
@@ -67,7 +68,8 @@ def ensure_db() -> str:
             raise
 
     # 親コメント→返信の並び替えを高速化。
-    # ローカルに展開した静的DBなので、一度作れば以後の検索で再利用できる。
+    # 静的DBなので一度作れば以後のページ取得で使い回せる。
+    con = None
     try:
         con = sqlite3.connect(DB_FILE)
         con.execute(
@@ -78,10 +80,12 @@ def ensure_db() -> str:
         )
         con.execute("PRAGMA optimize")
         con.commit()
-        con.close()
     except sqlite3.Error:
         # インデックス作成に失敗しても検索自体は可能
         pass
+    finally:
+        if con is not None:
+            con.close()
 
     return os.path.abspath(DB_FILE)
 
@@ -93,7 +97,7 @@ DB_PATH = ensure_db()
 # SQLite接続
 # =========================
 def open_db() -> sqlite3.Connection:
-    # datasetは更新されないので immutable=1 でロック処理を省き高速化
+    # datasetは更新されないので immutable=1 でロック処理を省く
     uri = f"file:{DB_PATH}?mode=ro&immutable=1"
     con = sqlite3.connect(uri, uri=True, timeout=10)
     con.execute("PRAGMA query_only=ON")
@@ -159,9 +163,12 @@ def build_where(user_q: str, text_q: str) -> tuple[str, list[str]]:
 @st.cache_data(show_spinner=False, max_entries=128)
 def count_matches(user_q: str, text_q: str) -> int:
     where, params = build_where(user_q, text_q)
-    with open_db() as con:
+    con = open_db()
+    try:
         row = con.execute("SELECT COUNT(*) FROM comments" + where, params).fetchone()
-    return int(row[0])
+        return int(row[0])
+    finally:
+        con.close()
 
 
 @st.cache_data(show_spinner=False, max_entries=512)
@@ -177,8 +184,15 @@ def fetch_page(user_q: str, text_q: str, page: int):
         + " ORDER BY COALESCE(parent_id, id) DESC, datetime ASC LIMIT ? OFFSET ?"
     )
 
-    with open_db() as con:
+    con = open_db()
+    try:
         return con.execute(sql, [*params, PAGE_SIZE, offset]).fetchall()
+    finally:
+        con.close()
+
+
+def set_result_page(page: int) -> None:
+    st.session_state["result_page"] = int(page)
 
 
 # =========================
@@ -224,38 +238,40 @@ if "search_total" in st.session_state:
     search_text = st.session_state.get("search_text", "")
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
-    # 新しい検索でページ数が減った場合の補正
     current_page = int(st.session_state.get("result_page", 1))
-    if current_page > total_pages:
-        current_page = total_pages
-        st.session_state["result_page"] = current_page
+    current_page = max(1, min(current_page, total_pages))
+    st.session_state["result_page"] = current_page
 
     col_prev, col_page, col_next = st.columns([1, 2, 1])
 
     with col_prev:
-        if st.button("← 前の200件", disabled=current_page <= 1, use_container_width=True):
-            st.session_state["result_page"] = current_page - 1
-            st.rerun()
+        st.button(
+            "← 前の200件",
+            disabled=current_page <= 1,
+            use_container_width=True,
+            on_click=set_result_page,
+            args=(current_page - 1,),
+        )
 
     with col_page:
-        page = st.number_input(
+        st.number_input(
             "ページ",
             min_value=1,
             max_value=total_pages,
-            value=current_page,
             step=1,
-            key="page_number_input",
+            key="result_page",
         )
-        if int(page) != current_page:
-            st.session_state["result_page"] = int(page)
-            st.rerun()
 
     with col_next:
-        if st.button("次の200件 →", disabled=current_page >= total_pages, use_container_width=True):
-            st.session_state["result_page"] = current_page + 1
-            st.rerun()
+        st.button(
+            "次の200件 →",
+            disabled=current_page >= total_pages,
+            use_container_width=True,
+            on_click=set_result_page,
+            args=(current_page + 1,),
+        )
 
-    current_page = int(st.session_state.get("result_page", 1))
+    current_page = int(st.session_state["result_page"])
 
     if total == 0:
         st.info("該当するコメントはありません。")
