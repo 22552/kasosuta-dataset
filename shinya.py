@@ -1,139 +1,282 @@
-import streamlit as st
-import requests
-import sqlite3
 import gzip
-import shutil
-import os
 import html
-import urllib.parse
+import os
 import re
+import shutil
+import sqlite3
+import urllib.parse
+from pathlib import Path
+
+import requests
+import streamlit as st
 
 DB_GZ_URL = "https://github.com/22552/kasosuta-dataset/releases/download/dai2v1/cmt.db.gz"
 DB_FILE = "comments.db"
 GZ_FILE = "cmt.db.gz"
+PAGE_SIZE = 200
+
 
 # =========================
 # DB準備
 # =========================
-def ensure_db():
-    if os.path.exists(DB_FILE):
-        return
+def _valid_sqlite(path: str) -> bool:
+    if not os.path.exists(path) or os.path.getsize(path) < 4096:
+        return False
+    try:
+        con = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+        con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        con.close()
+        return True
+    except sqlite3.Error:
+        return False
 
-    if not os.path.exists(GZ_FILE):
-        r = requests.get(DB_GZ_URL, stream=True, timeout=120)
-        r.raise_for_status()
-        with open(GZ_FILE, "wb") as f:
-            for chunk in r.iter_content(8192):
-                f.write(chunk)
 
-    with gzip.open(GZ_FILE, "rb") as f_in:
-        with open(DB_FILE, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+@st.cache_resource(show_spinner="コメントDBを準備しています…")
+def ensure_db() -> str:
+    if not _valid_sqlite(DB_FILE):
+        # 壊れた/途中のDBは再利用しない
+        if os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
 
-ensure_db()
+        if not os.path.exists(GZ_FILE) or os.path.getsize(GZ_FILE) == 0:
+            gz_tmp = GZ_FILE + ".tmp"
+            if os.path.exists(gz_tmp):
+                os.remove(gz_tmp)
+
+            with requests.get(DB_GZ_URL, stream=True, timeout=(15, 180)) as r:
+                r.raise_for_status()
+                with open(gz_tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            os.replace(gz_tmp, GZ_FILE)
+
+        db_tmp = DB_FILE + ".tmp"
+        if os.path.exists(db_tmp):
+            os.remove(db_tmp)
+
+        try:
+            with gzip.open(GZ_FILE, "rb") as f_in, open(db_tmp, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
+            if not _valid_sqlite(db_tmp):
+                raise RuntimeError("展開したSQLite DBが壊れています")
+            os.replace(db_tmp, DB_FILE)
+        except Exception:
+            if os.path.exists(db_tmp):
+                os.remove(db_tmp)
+            raise
+
+    # 親コメント→返信の並び替えを高速化。
+    # ローカルに展開した静的DBなので、一度作れば以後の検索で再利用できる。
+    try:
+        con = sqlite3.connect(DB_FILE)
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_comments_thread_datetime
+            ON comments(COALESCE(parent_id, id) DESC, datetime ASC)
+            """
+        )
+        con.execute("PRAGMA optimize")
+        con.commit()
+        con.close()
+    except sqlite3.Error:
+        # インデックス作成に失敗しても検索自体は可能
+        pass
+
+    return os.path.abspath(DB_FILE)
+
+
+DB_PATH = ensure_db()
+
 
 # =========================
 # SQLite接続
 # =========================
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-cur = conn.cursor()
+def open_db() -> sqlite3.Connection:
+    # datasetは更新されないので immutable=1 でロック処理を省き高速化
+    uri = f"file:{DB_PATH}?mode=ro&immutable=1"
+    con = sqlite3.connect(uri, uri=True, timeout=10)
+    con.execute("PRAGMA query_only=ON")
+    con.execute("PRAGMA temp_store=MEMORY")
+    con.execute("PRAGMA cache_size=-65536")
+    try:
+        con.execute("PRAGMA mmap_size=268435456")
+    except sqlite3.Error:
+        pass
+    return con
+
+
+# =========================
+# 検索SQL生成
+# =========================
+def _variants(value: str) -> list[str]:
+    """通常 / HTML escape / URL encode を重複なしで返す。"""
+    values = [value, html.escape(value), urllib.parse.quote(value)]
+    return list(dict.fromkeys(values))
+
+
+def build_where(user_q: str, text_q: str) -> tuple[str, list[str]]:
+    clauses: list[str] = []
+    params: list[str] = []
+
+    user_q = (user_q or "").strip()
+    text_q = (text_q or "").strip()
+
+    if user_q:
+        clauses.append("user LIKE ?")
+        params.append(f"%{user_q}%")
+
+    if text_q:
+        for word in re.split(r"\s+", text_q):
+            if not word:
+                continue
+
+            is_exclude = word.startswith("-") and len(word) > 1
+            search_word = word[1:] if is_exclude else word
+
+            # OR: foo|bar
+            if "|" in search_word and not is_exclude:
+                groups = []
+                for part in (p for p in search_word.split("|") if p):
+                    variants = _variants(part)
+                    groups.append("(" + " OR ".join("content LIKE ?" for _ in variants) + ")")
+                    params.extend(f"%{v}%" for v in variants)
+                if groups:
+                    clauses.append("(" + " OR ".join(groups) + ")")
+                continue
+
+            variants = _variants(search_word)
+            if is_exclude:
+                clauses.append("(" + " AND ".join("content NOT LIKE ?" for _ in variants) + ")")
+            else:
+                clauses.append("(" + " OR ".join("content LIKE ?" for _ in variants) + ")")
+            params.extend(f"%{v}%" for v in variants)
+
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    return where, params
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def count_matches(user_q: str, text_q: str) -> int:
+    where, params = build_where(user_q, text_q)
+    with open_db() as con:
+        row = con.execute("SELECT COUNT(*) FROM comments" + where, params).fetchone()
+    return int(row[0])
+
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def fetch_page(user_q: str, text_q: str, page: int):
+    page = max(1, int(page))
+    offset = (page - 1) * PAGE_SIZE
+    where, params = build_where(user_q, text_q)
+
+    sql = (
+        "SELECT id,user,datetime,content,is_reply,parent_id "
+        "FROM comments"
+        + where
+        + " ORDER BY COALESCE(parent_id, id) DESC, datetime ASC LIMIT ? OFFSET ?"
+    )
+
+    with open_db() as con:
+        return con.execute(sql, [*params, PAGE_SIZE, offset]).fetchall()
+
 
 # =========================
 # UI
 # =========================
 st.title("Scratch コメント高度検索")
 st.write("八戸市にいこう!")
+st.caption("検索対象はDB全体。表示だけ1ページ200件です。")
 
 with st.expander("🔍 検索の使いかた", expanded=False):
-    st.markdown("""
-    - **AND検索**: スペースで区切ると「すべて含む」になります（例: `scratch 猫`）
-    - **除外検索**: 単語の前に `-` をつけると除外します（例: `scratch -宣伝`）
-    - **OR検索**: `|` (縦棒) で区切ると「いずれかを含む」になります（例: `バグ|不具合`）
-    - **記号・絵文字**: `>>` や絵文字も自動変換して検索します
-    """)
+    st.markdown(
+        """
+- **AND検索**: スペース区切り（例: `scratch 猫`）
+- **除外検索**: `-単語`（例: `scratch -宣伝`）
+- **OR検索**: `|` 区切り（例: `バグ|不具合`）
+- **記号・絵文字**: 通常 / HTMLエスケープ / URLエンコードを自動で検索
+        """
+    )
 
-user_q = st.text_input("ユーザー名")
-text_q = st.text_input("検索（内容）", placeholder="例: りんご バナナ -スイカ")
+with st.form("search_form"):
+    user_q = st.text_input("ユーザー名")
+    text_q = st.text_input("検索（内容）", placeholder="例: りんご バナナ -スイカ")
+    submitted = st.form_submit_button("検索", type="primary")
 
-if st.button("検索"):
-    query = "SELECT id,user,datetime,content,is_reply,parent_id FROM comments WHERE 1=1"
-    params = []
+if submitted:
+    clean_user = user_q.strip()
+    clean_text = text_q.strip()
+    with st.spinner("全体から検索しています…"):
+        total = count_matches(clean_user, clean_text)
 
-    if user_q:
-        query += " AND user LIKE ?"
-        params.append(f"%{user_q}%")
+    st.session_state["search_user"] = clean_user
+    st.session_state["search_text"] = clean_text
+    st.session_state["search_total"] = total
+    st.session_state["result_page"] = 1
 
-    if text_q:
-        # スペース（全角半角）で分割
-        words = re.split(r'\s+', text_q.strip())
-        
-        for word in words:
-            if not word: continue
-            
-            # 除外検索 (先頭がマイナス)
-            is_exclude = word.startswith('-') and len(word) > 1
-            search_word = word[1:] if is_exclude else word
-            operator = "NOT LIKE" if is_exclude else "LIKE"
-            conjunction = "AND" if is_exclude else "AND" # AND条件の中でLIKEかNOT LIKEか
-
-            # OR検索 (縦棒 | が含まれる場合)
-            if '|' in search_word and not is_exclude:
-                or_parts = search_word.split('|')
-                or_clauses = []
-                for p in or_parts:
-                    # 各パーツに対して通常・HTML・URLの3パターン作成
-                    p_esc = html.escape(p)
-                    p_url = urllib.parse.quote(p)
-                    or_clauses.append("(content LIKE ? OR content LIKE ? OR content LIKE ?)")
-                    params.extend([f"%{p}%", f"%{p_esc}%", f"%{p_url}%"])
-                query += f" AND ({' OR '.join(or_clauses)})"
-            
-            else:
-                # 通常のAND/除外検索 (通常・HTML・URLの3パターン対応)
-                w_esc = html.escape(search_word)
-                w_url = urllib.parse.quote(search_word)
-                
-                if is_exclude:
-                    # 除外の場合は「どれにも含まれない」必要がある
-                    query += f" AND (content NOT LIKE ? AND content NOT LIKE ? AND content NOT LIKE ?)"
-                else:
-                    # 含む場合は「どれかに含まれれば良い」
-                    query += f" AND (content LIKE ? OR content LIKE ? OR content LIKE ?)"
-                
-                params.extend([f"%{search_word}%", f"%{w_esc}%", f"%{w_url}%"])
-
-    # 並び替え
-    query += " ORDER BY COALESCE(parent_id, id) DESC, datetime ASC"
-
-    rows = cur.execute(query, params).fetchall()
-    st.session_state["rows"] = rows
-    st.session_state["page"] = 1
 
 # =========================
 # ページ表示
 # =========================
-if "rows" in st.session_state:
-    rows = st.session_state["rows"]
-    page_size = 200
-    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+if "search_total" in st.session_state:
+    total = int(st.session_state["search_total"])
+    search_user = st.session_state.get("search_user", "")
+    search_text = st.session_state.get("search_text", "")
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
-    page = st.number_input("ページ", min_value=1, max_value=total_pages, 
-                           value=st.session_state.get("page", 1), key="page_input")
+    # 新しい検索でページ数が減った場合の補正
+    current_page = int(st.session_state.get("result_page", 1))
+    if current_page > total_pages:
+        current_page = total_pages
+        st.session_state["result_page"] = current_page
 
-    start = (page - 1) * page_size
-    end = start + page_size
+    col_prev, col_page, col_next = st.columns([1, 2, 1])
 
-    st.write(f"結果: {len(rows)} 件 ( {start+1} - {min(end, len(rows))} 表示 )")
+    with col_prev:
+        if st.button("← 前の200件", disabled=current_page <= 1, use_container_width=True):
+            st.session_state["result_page"] = current_page - 1
+            st.rerun()
 
-    for r in rows[start:end]:
-        prefix = "↳ " if r[4] == 1 else ""
-        parent = f"(返信先: {r[5]})" if r[4] == 1 else ""
-        
-        # デコードして表示
-        display_content = html.unescape(r[3])
-        try:
-            display_content = urllib.parse.unquote(display_content)
-        except:
-            pass
-            
-        st.write(f"{prefix}ID:{r[0]} [{r[2]}] {r[1]}: {display_content} {parent}")
+    with col_page:
+        page = st.number_input(
+            "ページ",
+            min_value=1,
+            max_value=total_pages,
+            value=current_page,
+            step=1,
+            key="page_number_input",
+        )
+        if int(page) != current_page:
+            st.session_state["result_page"] = int(page)
+            st.rerun()
+
+    with col_next:
+        if st.button("次の200件 →", disabled=current_page >= total_pages, use_container_width=True):
+            st.session_state["result_page"] = current_page + 1
+            st.rerun()
+
+    current_page = int(st.session_state.get("result_page", 1))
+
+    if total == 0:
+        st.info("該当するコメントはありません。")
+    else:
+        start = (current_page - 1) * PAGE_SIZE + 1
+        end = min(current_page * PAGE_SIZE, total)
+        st.write(
+            f"**{total:,} 件ヒット** — {start:,}〜{end:,}件 / "
+            f"{current_page:,}/{total_pages:,}ページ"
+        )
+
+        with st.spinner("ページを読み込んでいます…"):
+            rows = fetch_page(search_user, search_text, current_page)
+
+        for r in rows:
+            prefix = "↳ " if r[4] == 1 else ""
+            parent = f" (返信先: {r[5]})" if r[4] == 1 else ""
+            display_content = html.unescape(r[3] or "")
+            try:
+                display_content = urllib.parse.unquote(display_content)
+            except Exception:
+                pass
+
+            st.write(f"{prefix}ID:{r[0]} [{r[2]}] {r[1]}: {display_content}{parent}")
